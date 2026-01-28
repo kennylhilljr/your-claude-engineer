@@ -1,0 +1,11 @@
+# Agent-generated output directories
+generations/
+
+# Log files
+logs/
+
+.env
+venv
+venv_linux
+.env.tmp
+__pycache__
