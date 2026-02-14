@@ -5,16 +5,19 @@ This module provides the MetricsStore class which handles:
 - Atomic writes using write-then-rename pattern (write to temp file, then rename)
 - FIFO eviction: keep last 500 events, last 50 sessions
 - Corruption recovery: if JSON is invalid, restore from .bak file or create fresh state
-- Thread-safe operations using file-based locking
+- Cross-process safe operations using fcntl file locking
 
 The MetricsStore integrates with the TypedDict types from metrics.py and provides
 a reliable persistence layer for the dashboard's metrics data.
 """
 
+import contextlib
+import fcntl
 import json
 import os
 import tempfile
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -22,14 +25,71 @@ from typing import Optional
 from metrics import DashboardState
 
 
+class LockAcquisitionError(Exception):
+    """Raised when file lock cannot be acquired within timeout."""
+    pass
+
+
+@contextlib.contextmanager
+def _file_lock(lock_path: Path, timeout: float = 10.0):
+    """Context manager for cross-process file locking using fcntl.
+
+    Uses exclusive non-blocking locks with retry logic to prevent race conditions.
+
+    Args:
+        lock_path: Path to lock file
+        timeout: Maximum time to wait for lock in seconds
+
+    Yields:
+        None when lock is acquired
+
+    Raises:
+        LockAcquisitionError: If lock cannot be acquired within timeout
+    """
+    lock_fd = None
+    try:
+        # Open lock file (create if doesn't exist)
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_WRONLY, 0o644)
+
+        # Try to acquire lock with retry logic
+        start_time = time.time()
+        while True:
+            try:
+                # Try to acquire exclusive non-blocking lock
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break  # Lock acquired
+            except (IOError, OSError) as e:
+                # Lock is held by another process
+                if time.time() - start_time >= timeout:
+                    raise LockAcquisitionError(
+                        f"Could not acquire lock on {lock_path} within {timeout}s"
+                    ) from e
+                time.sleep(0.01)  # Wait 10ms before retry
+
+        yield  # Lock is held, execute protected code
+
+    finally:
+        # Always release lock and close file descriptor
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except (IOError, OSError):
+                pass  # Ignore errors during unlock
+            try:
+                os.close(lock_fd)
+            except (IOError, OSError):
+                pass  # Ignore errors during close
+
+
 class MetricsStore:
-    """Thread-safe JSON persistence layer for dashboard metrics.
+    """Thread-safe and cross-process-safe JSON persistence layer for dashboard metrics.
 
     Manages loading, saving, and maintaining the .agent_metrics.json file with:
     - Atomic writes to prevent data corruption during writes
     - FIFO eviction to cap storage at 500 events and 50 sessions
     - Automatic backup and recovery from corrupted JSON files
-    - Thread-safe operations via lock file mechanism
+    - Cross-process safe operations via fcntl file locking
+    - Comprehensive exception handling
 
     Usage:
         store = MetricsStore(project_name="my-project")
@@ -47,6 +107,9 @@ class MetricsStore:
     BACKUP_FILE = ".agent_metrics.json.bak"
     LOCK_FILE = ".agent_metrics.lock"
 
+    # Lock timeout (seconds)
+    LOCK_TIMEOUT = 10.0
+
     def __init__(self, project_name: str, metrics_dir: Optional[Path] = None):
         """Initialize MetricsStore.
 
@@ -62,31 +125,6 @@ class MetricsStore:
 
         # Thread lock for in-process synchronization
         self._thread_lock = threading.Lock()
-
-    def _acquire_lock(self) -> None:
-        """Acquire file lock for cross-process synchronization.
-
-        Creates a lock file to prevent concurrent writes from multiple processes.
-        Uses a simple lock file mechanism - in production, consider using fcntl or similar.
-        """
-        # Wait for lock to be available (simple spin-lock)
-        max_attempts = 100
-        attempt = 0
-        while self.lock_path.exists() and attempt < max_attempts:
-            import time
-            time.sleep(0.01)  # 10ms
-            attempt += 1
-
-        if attempt >= max_attempts:
-            # Force remove stale lock
-            self.lock_path.unlink(missing_ok=True)
-
-        # Create lock file
-        self.lock_path.touch()
-
-    def _release_lock(self) -> None:
-        """Release file lock."""
-        self.lock_path.unlink(missing_ok=True)
 
     def _create_empty_state(self) -> DashboardState:
         """Create a fresh empty DashboardState.
@@ -167,109 +205,158 @@ class MetricsStore:
         Attempts to load from .agent_metrics.json. If the file is corrupted:
         1. Try to restore from .agent_metrics.json.bak
         2. If backup is also corrupted, create a fresh empty state
+        3. All recovery operations use atomic writes
 
         Returns:
             DashboardState loaded from disk or freshly created
         """
         with self._thread_lock:
-            self._acquire_lock()
-            try:
-                # Try to load main file
-                if self.metrics_path.exists():
-                    try:
-                        with open(self.metrics_path, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
+            with _file_lock(self.lock_path, self.LOCK_TIMEOUT):
+                try:
+                    # Try to load main file
+                    if self.metrics_path.exists():
+                        try:
+                            with open(self.metrics_path, 'r', encoding='utf-8') as f:
+                                data = json.load(f)
 
-                        # Validate structure
-                        if self._validate_state(data):
-                            return data  # type: ignore
-                        else:
-                            # Structure invalid, try backup
-                            raise ValueError("Invalid state structure")
+                            # Validate structure
+                            if self._validate_state(data):
+                                return data  # type: ignore
+                            else:
+                                # Structure invalid, try backup
+                                raise ValueError("Invalid state structure")
 
-                    except (json.JSONDecodeError, ValueError) as e:
-                        # Main file is corrupted, try backup
-                        if self.backup_path.exists():
-                            try:
-                                with open(self.backup_path, 'r', encoding='utf-8') as f:
-                                    data = json.load(f)
+                        except (json.JSONDecodeError, ValueError) as e:
+                            # Main file is corrupted, try backup
+                            if self.backup_path.exists():
+                                try:
+                                    with open(self.backup_path, 'r', encoding='utf-8') as f:
+                                        data = json.load(f)
 
-                                if self._validate_state(data):
-                                    # Successfully recovered from backup
-                                    # Save it back to main file
-                                    with open(self.metrics_path, 'w', encoding='utf-8') as f:
-                                        json.dump(data, f, indent=2)
-                                    return data  # type: ignore
-                            except (json.JSONDecodeError, ValueError):
-                                pass  # Backup also corrupted
+                                    if self._validate_state(data):
+                                        # Successfully recovered from backup
+                                        # Atomically save it back to main file
+                                        self._atomic_write(self.metrics_path, data)
+                                        return data  # type: ignore
+                                except (json.JSONDecodeError, ValueError):
+                                    pass  # Backup also corrupted
 
-                        # Both files corrupted or backup doesn't exist
-                        # Create fresh state
-                        pass
+                            # Both files corrupted or backup doesn't exist
+                            # Create fresh state
+                            pass
 
-                # No file exists or all recovery attempts failed - create fresh state
-                return self._create_empty_state()
+                    # No file exists or all recovery attempts failed - create fresh state
+                    return self._create_empty_state()
 
-            finally:
-                self._release_lock()
+                except LockAcquisitionError:
+                    # If we can't get the lock, return empty state rather than failing
+                    return self._create_empty_state()
+
+    def _atomic_write(self, target_path: Path, data: dict) -> None:
+        """Atomically write data to target file using temp file + rename.
+
+        Args:
+            target_path: Final destination path
+            data: Dictionary to write as JSON
+        """
+        # Write to temporary file first (atomic write pattern)
+        temp_fd, temp_path = tempfile.mkstemp(
+            dir=self.metrics_dir,
+            prefix='.agent_metrics_',
+            suffix='.tmp'
+        )
+
+        try:
+            # Write JSON to temp file
+            with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())  # Ensure data is written to disk
+
+            # Atomically rename temp file to target
+            # On POSIX systems, rename is atomic
+            os.replace(temp_path, target_path)
+
+        except Exception as e:
+            # Clean up temp file on error
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+            raise e
+
+    def _atomic_backup(self, source_path: Path, backup_path: Path) -> None:
+        """Atomically create backup using temp file + rename pattern.
+
+        Args:
+            source_path: File to backup
+            backup_path: Final backup destination
+        """
+        if not source_path.exists():
+            return
+
+        # Read source file
+        with open(source_path, 'r', encoding='utf-8') as src:
+            backup_data = json.load(src)
+
+        # Write to temp file then rename atomically
+        temp_fd, temp_path = tempfile.mkstemp(
+            dir=self.metrics_dir,
+            prefix='.agent_metrics_bak_',
+            suffix='.tmp'
+        )
+
+        try:
+            # Write backup to temp file
+            with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
+                json.dump(backup_data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())  # Ensure backup is flushed to disk
+
+            # Atomically rename temp file to backup path
+            os.replace(temp_path, backup_path)
+
+        except Exception as e:
+            # Clean up temp file on error
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+            raise e
 
     def save(self, state: DashboardState) -> None:
         """Save DashboardState to disk with atomic write.
 
         Uses write-then-rename pattern to ensure atomicity:
-        1. Apply FIFO eviction to keep storage bounded
-        2. Write to temporary file
-        3. Create backup of existing file
-        4. Atomically rename temp file to main file
+        1. Validate state structure before writing
+        2. Apply FIFO eviction to keep storage bounded
+        3. Create atomic backup of existing file
+        4. Write to temporary file
+        5. Atomically rename temp file to main file
 
         This ensures that the main file is never in a partially-written state.
 
         Args:
             state: DashboardState to save
+
+        Raises:
+            ValueError: If state validation fails
+            LockAcquisitionError: If lock cannot be acquired
         """
         with self._thread_lock:
-            self._acquire_lock()
-            try:
+            with _file_lock(self.lock_path, self.LOCK_TIMEOUT):
+                # Validate state structure before writing
+                if not self._validate_state(state):
+                    raise ValueError("Invalid DashboardState structure - cannot save")
+
                 # Update timestamp
                 state["updated_at"] = datetime.utcnow().isoformat() + "Z"
 
                 # Apply FIFO eviction
                 state = self._apply_fifo_eviction(state)
 
-                # Write to temporary file first (atomic write pattern)
-                temp_fd, temp_path = tempfile.mkstemp(
-                    dir=self.metrics_dir,
-                    prefix='.agent_metrics_',
-                    suffix='.tmp'
-                )
+                # Create atomic backup of existing file before overwriting
+                if self.metrics_path.exists():
+                    self._atomic_backup(self.metrics_path, self.backup_path)
 
-                try:
-                    # Write JSON to temp file
-                    with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
-                        json.dump(state, f, indent=2, ensure_ascii=False)
-                        f.flush()
-                        os.fsync(f.fileno())  # Ensure data is written to disk
-
-                    # Create backup of existing file before overwriting
-                    if self.metrics_path.exists():
-                        # Copy existing file to backup
-                        with open(self.metrics_path, 'r', encoding='utf-8') as src:
-                            backup_data = src.read()
-                        with open(self.backup_path, 'w', encoding='utf-8') as dst:
-                            dst.write(backup_data)
-
-                    # Atomically rename temp file to main file
-                    # On POSIX systems, rename is atomic
-                    os.replace(temp_path, self.metrics_path)
-
-                except Exception as e:
-                    # Clean up temp file on error
-                    if os.path.exists(temp_path):
-                        os.unlink(temp_path)
-                    raise e
-
-            finally:
-                self._release_lock()
+                # Atomically write main file
+                self._atomic_write(self.metrics_path, state)
 
     def get_stats(self) -> dict:
         """Get storage statistics.

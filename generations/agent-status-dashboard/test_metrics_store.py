@@ -7,9 +7,11 @@ Tests verify:
 4. Corruption recovery scenarios
 5. Edge cases (empty state, missing file, etc.)
 6. Thread-safety (basic verification)
+7. Cross-process safety (multiprocessing verification)
 """
 
 import json
+import multiprocessing
 import os
 import tempfile
 import threading
@@ -741,6 +743,204 @@ class TestMetricsStoreIntegration(unittest.TestCase):
         self.assertEqual(len(loaded["sessions"]), 2)
         self.assertEqual(loaded["sessions"][0]["session_id"], "session-1")
         self.assertEqual(loaded["sessions"][1]["session_id"], "session-2")
+
+
+class TestCrossProcessSafety(unittest.TestCase):
+    """Test cross-process safety using multiprocessing.
+
+    These tests verify that the file locking mechanism works correctly
+    across separate OS processes, not just threads.
+    """
+
+    def setUp(self):
+        """Create temporary directory for each test."""
+        self.temp_dir = tempfile.mkdtemp()
+        self.store = MetricsStore(
+            project_name="test-project",
+            metrics_dir=Path(self.temp_dir)
+        )
+
+    def tearDown(self):
+        """Clean up temporary directory."""
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    @staticmethod
+    def _process_increment_worker(temp_dir: str, iterations: int, process_id: int) -> None:
+        """Worker function that runs in a separate process.
+
+        Args:
+            temp_dir: Directory containing metrics files
+            iterations: Number of increment operations to perform
+            process_id: ID of this process for debugging
+        """
+        store = MetricsStore(
+            project_name="test-project",
+            metrics_dir=Path(temp_dir)
+        )
+
+        for i in range(iterations):
+            try:
+                # Load current state
+                state = store.load()
+
+                # Increment counter
+                state["total_sessions"] += 1
+
+                # Save back
+                store.save(state)
+
+                # Small delay to increase chance of collisions
+                time.sleep(0.001)
+            except Exception as e:
+                # Log error but continue
+                print(f"Process {process_id} iteration {i} error: {e}")
+
+    def test_concurrent_writes_from_multiple_processes(self):
+        """Test concurrent writes from multiple OS processes.
+
+        This verifies that file locking prevents race conditions across
+        separate processes, not just threads within the same process.
+        """
+        # Initialize state
+        state = self.store.load()
+        state["total_sessions"] = 0
+        self.store.save(state)
+
+        # Launch multiple processes that each increment the counter
+        num_processes = 4
+        iterations_per_process = 10
+
+        processes = []
+        for i in range(num_processes):
+            p = multiprocessing.Process(
+                target=self._process_increment_worker,
+                args=(self.temp_dir, iterations_per_process, i)
+            )
+            processes.append(p)
+            p.start()
+
+        # Wait for all processes to complete
+        for p in processes:
+            p.join(timeout=30)  # 30 second timeout
+            if p.is_alive():
+                p.terminate()
+                self.fail("Process did not complete within timeout")
+
+        # Load final state and verify count
+        final_state = self.store.load()
+
+        # All increments should be recorded (no lost updates due to race conditions)
+        expected_total = num_processes * iterations_per_process
+        self.assertEqual(
+            final_state["total_sessions"],
+            expected_total,
+            f"Expected {expected_total} total sessions, got {final_state['total_sessions']}. "
+            "This indicates lost updates due to race conditions."
+        )
+
+    @staticmethod
+    def _process_event_writer(temp_dir: str, num_events: int, process_id: int) -> None:
+        """Worker that writes events from a separate process.
+
+        Args:
+            temp_dir: Directory containing metrics files
+            num_events: Number of events to write
+            process_id: ID of this process for unique event IDs
+        """
+        store = MetricsStore(
+            project_name="test-project",
+            metrics_dir=Path(temp_dir)
+        )
+
+        for i in range(num_events):
+            try:
+                state = store.load()
+
+                # Add an event with unique ID
+                event: AgentEvent = {
+                    "event_id": f"event-p{process_id}-{i}",
+                    "agent_name": "coding",
+                    "session_id": f"session-p{process_id}",
+                    "ticket_key": "AI-45",
+                    "started_at": "2026-02-14T10:00:00Z",
+                    "ended_at": "2026-02-14T10:05:00Z",
+                    "duration_seconds": 300.0,
+                    "status": "success",
+                    "input_tokens": 1000,
+                    "output_tokens": 2000,
+                    "total_tokens": 3000,
+                    "estimated_cost_usd": 0.09,
+                    "artifacts": [],
+                    "error_message": "",
+                    "model_used": "claude-sonnet-4-5",
+                }
+                state["events"].append(event)
+
+                store.save(state)
+                time.sleep(0.001)
+            except Exception as e:
+                print(f"Process {process_id} event {i} error: {e}")
+
+    def test_concurrent_event_writes_from_multiple_processes(self):
+        """Test concurrent event writes from multiple processes.
+
+        Verifies that events from different processes are all persisted
+        without corruption or data loss.
+        """
+        # Initialize empty state
+        state = self.store.load()
+        self.store.save(state)
+
+        # Launch processes that each write events
+        num_processes = 3
+        events_per_process = 5
+
+        processes = []
+        for i in range(num_processes):
+            p = multiprocessing.Process(
+                target=self._process_event_writer,
+                args=(self.temp_dir, events_per_process, i)
+            )
+            processes.append(p)
+            p.start()
+
+        # Wait for all processes
+        for p in processes:
+            p.join(timeout=30)
+            if p.is_alive():
+                p.terminate()
+                self.fail("Process did not complete within timeout")
+
+        # Load final state
+        final_state = self.store.load()
+
+        # Verify all events were written
+        expected_events = num_processes * events_per_process
+        self.assertEqual(
+            len(final_state["events"]),
+            expected_events,
+            f"Expected {expected_events} events, got {len(final_state['events'])}. "
+            "This indicates lost events due to race conditions."
+        )
+
+        # Verify all event IDs are unique (no overwrites)
+        event_ids = [e["event_id"] for e in final_state["events"]]
+        self.assertEqual(
+            len(event_ids),
+            len(set(event_ids)),
+            "Duplicate event IDs found - indicates data corruption"
+        )
+
+        # Verify we have events from all processes
+        for process_id in range(num_processes):
+            process_events = [e for e in final_state["events"] if f"p{process_id}" in e["event_id"]]
+            self.assertEqual(
+                len(process_events),
+                events_per_process,
+                f"Process {process_id} should have written {events_per_process} events, "
+                f"but found {len(process_events)}"
+            )
 
 
 if __name__ == "__main__":
